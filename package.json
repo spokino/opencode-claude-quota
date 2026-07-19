@@ -1,0 +1,52 @@
+{
+  "name": "opencode-claude-quota",
+  "version": "0.1.0",
+  "description": "Show your real Claude subscription usage (5-hour session + weekly limits) in the OpenCode TUI sidebar",
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "tui",
+    "claude",
+    "anthropic",
+    "usage",
+    "quota",
+    "rate-limit",
+    "sidebar"
+  ],
+  "author": "spokino",
+  "license": "MIT",
+  "homepage": "https://github.com/spokino/opencode-claude-quota#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/spokino/opencode-claude-quota.git"
+  },
+  "bugs": {
+    "url": "https://github.com/spokino/opencode-claude-quota/issues"
+  },
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js"
+    },
+    "./tui": {
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "bun build ./src/index.tsx --target=node --external @opentui/solid --external solid-js --outfile ./dist/index.js",
+    "prepublishOnly": "bun run build"
+  },
+  "peerDependencies": {
+    "@opentui/solid": "*",
+    "solid-js": "*"
+  },
+  "devDependencies": {
+    "solid-js": "^1.9.0"
+  }
+}
