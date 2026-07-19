@@ -12,8 +12,8 @@
 // read-only, and stores nothing. Use at your own risk.
 import { createRoot, createSignal, onCleanup } from "solid-js";
 import { jsx, jsxs } from "@opentui/solid/jsx-runtime";
-import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { readFileSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
 const VERSION = "0.1.0";
@@ -91,7 +91,8 @@ function labelFor(kind: string, scope: any): string {
   return kind;
 }
 
-async function fetchUsage(): Promise<Row[]> {
+// Raw fetch of the live endpoint. Returns rows + the fetch timestamp.
+async function fetchUsageRaw(): Promise<Row[]> {
   const auth = readAuth();
   if (!auth) throw new Error("no-token");
 
@@ -133,6 +134,81 @@ async function fetchUsage(): Promise<Row[]> {
   return rows;
 }
 
+// ---- Shared cross-instance cache (so N OpenCode instances = 1 fetch/interval) ----
+// All instances share one JSON file in the OS temp dir. Each instance, on its
+// tick, reads the file: if fresh (< POLL_MS old) it just renders the cached
+// rows and makes NO network call. If stale, a soft "fetching" lock (a recent
+// timestamp) lets exactly one instance do the fetch while others wait. The
+// small race window (two instances claiming within the same few ms) is
+// harmless - worst case an occasional double fetch, still far below N/interval.
+const CACHE_FILE =
+  process.env.CLAUDE_QUOTA_CACHE_FILE ||
+  join(tmpdir(), "opencode-claude-quota-cache.json");
+// How long another instance's "fetching" marker is honored before we assume it
+// died mid-fetch and take over.
+const LOCK_TTL_MS = 15_000;
+
+type Cache = {
+  rows?: Row[];
+  fetchedAt?: number; // ms epoch of last successful fetch
+  error?: string; // last error, if the last attempt failed
+  fetchingAt?: number; // ms epoch when an instance claimed the fetch lock
+};
+
+function readCache(): Cache {
+  try {
+    return JSON.parse(readFileSync(CACHE_FILE, "utf8")) as Cache;
+  } catch {
+    return {};
+  }
+}
+
+function writeCache(c: Cache): void {
+  try {
+    writeFileSync(CACHE_FILE, JSON.stringify(c), "utf8");
+  } catch {
+    /* best-effort; if temp is unwritable we just fall back to per-instance */
+  }
+}
+
+type Result = { rows: Row[]; error: string; fetchedAt?: number };
+
+// Returns the freshest data for rendering, fetching only when needed and only
+// from one instance at a time.
+async function getUsage(): Promise<Result> {
+  const now = Date.now();
+  const cache = readCache();
+
+  // 1. Cache is fresh -> render it, no network.
+  if (cache.fetchedAt && now - cache.fetchedAt < POLL_MS && cache.rows) {
+    return { rows: cache.rows, error: cache.error ?? "", fetchedAt: cache.fetchedAt };
+  }
+
+  // 2. Cache is stale. Is another instance already fetching (recent lock)?
+  if (cache.fetchingAt && now - cache.fetchingAt < LOCK_TTL_MS) {
+    // Someone else is on it. Show whatever we have (may be slightly stale).
+    return {
+      rows: cache.rows ?? [],
+      error: cache.rows ? (cache.error ?? "") : "refreshing...",
+      fetchedAt: cache.fetchedAt,
+    };
+  }
+
+  // 3. Claim the soft lock and fetch.
+  writeCache({ ...cache, fetchingAt: now });
+  try {
+    const rows = await fetchUsageRaw();
+    const fetchedAt = Date.now();
+    writeCache({ rows, fetchedAt, error: "", fetchingAt: undefined });
+    return { rows, error: "", fetchedAt };
+  } catch (e: any) {
+    const error = e?.message ?? "fetch failed";
+    // Keep the last good rows if we have them; record the error; clear lock.
+    writeCache({ ...cache, error, fetchingAt: undefined });
+    return { rows: cache.rows ?? [], error, fetchedAt: cache.fetchedAt };
+  }
+}
+
 let initialized = false;
 
 const tui = async (api: any) => {
@@ -149,26 +225,27 @@ const tui = async (api: any) => {
       api.kv?.get?.(EXPANDED_KV, true) !== false,
     );
 
+    function prettyErr(m: string): string {
+      if (m === "no-token") return "no Anthropic login in OpenCode";
+      if (m === "auth expired") return "token expired - reopen OpenCode";
+      return m || "fetch failed";
+    }
+
     async function refresh() {
-      try {
-        const r = await fetchUsage();
-        setRows(r);
-        setErr("");
-        setUpdated(new Date().toLocaleTimeString());
-      } catch (e: any) {
-        const m = e?.message;
-        setErr(
-          m === "no-token"
-            ? "no Anthropic login in OpenCode"
-            : m === "auth expired"
-              ? "token expired - reopen OpenCode"
-              : (m ?? "fetch failed"),
-        );
+      const res = await getUsage();
+      if (res.rows.length) setRows(res.rows);
+      setErr(res.error ? prettyErr(res.error) : "");
+      if (res.fetchedAt) {
+        setUpdated(new Date(res.fetchedAt).toLocaleTimeString());
       }
     }
 
+    // Tick often enough to pick up another instance's fresh cache promptly.
+    // getUsage() only hits the network when the SHARED cache is stale, so a
+    // short tick does NOT increase fetch volume - it just syncs the display.
+    const TICK_MS = Math.min(5_000, POLL_MS);
     refresh();
-    const timer = setInterval(refresh, POLL_MS);
+    const timer = setInterval(refresh, TICK_MS);
     onCleanup(() => clearInterval(timer));
 
     const TOGGLE = "claude-quota.toggle";

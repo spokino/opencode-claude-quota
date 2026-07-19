@@ -83,6 +83,20 @@ Optional environment variables:
 | `CLAUDE_QUOTA_POLL_MS` | `90000` | Refresh interval in ms (min 30000 - the endpoint rate-limits hard). |
 | `CLAUDE_QUOTA_BAR_WIDTH` | `18` | Progress bar width in characters (6-40). |
 | `CLAUDE_QUOTA_AUTH_PATH` | auto | Explicit path to OpenCode `auth.json` if auto-detection fails. |
+| `CLAUDE_QUOTA_CACHE_FILE` | temp dir | Path to the shared cross-instance cache file (see below). |
+
+## Multiple OpenCode instances
+
+If you run several OpenCode instances at once, they **share a single cache file**
+(in your OS temp dir) and coordinate so that **only one instance fetches per
+poll interval** - the rest render from the shared cache with no network call.
+All instances show the same, in-sync numbers, and you never trigger the
+endpoint's rate limit by multiplying requests.
+
+A soft lock (a short-lived "fetching" marker) prevents two instances from
+fetching at the same moment; if an instance dies mid-fetch, the lock expires
+after 15s and another takes over. Set `CLAUDE_QUOTA_CACHE_FILE` to override the
+cache location (e.g. to isolate profiles).
 
 `auth.json` is auto-detected across Windows / macOS / Linux OpenCode install
 locations.
