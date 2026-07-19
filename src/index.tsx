@@ -27,7 +27,7 @@ const POLL_MS = Math.max(
 const USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
 const BAR_WIDTH = Math.max(
   6,
-  Math.min(40, Number(process.env.CLAUDE_QUOTA_BAR_WIDTH) || 24),
+  Math.min(40, Number(process.env.CLAUDE_QUOTA_BAR_WIDTH) || 18),
 );
 
 // OpenCode auth.json locations, first match wins. Covers Windows, macOS, Linux.

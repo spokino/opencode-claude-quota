@@ -6,12 +6,12 @@ weekly limits) - live in the **OpenCode TUI sidebar**.
 
 ```
 ▼ ⚡ Claude usage 0.1.0
- Session (5h)              10%
- ████░░░░░░░░░░░░░░░░░░░░  resets in 3m
- Weekly all                 8%
- ███░░░░░░░░░░░░░░░░░░░░░  resets in 5d 11h
- Weekly Fable               0%
- ░░░░░░░░░░░░░░░░░░░░░░░░
+ Session (5h)          10%
+ ██░░░░░░░░░░░░░░░░  resets in 3m
+ Weekly all             8%
+ █░░░░░░░░░░░░░░░░░  resets in 5d 11h
+ Weekly Fable           0%
+ ░░░░░░░░░░░░░░░░░░
  updated 20:31:42
 ```
 
@@ -81,7 +81,7 @@ Optional environment variables:
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `CLAUDE_QUOTA_POLL_MS` | `90000` | Refresh interval in ms (min 30000 - the endpoint rate-limits hard). |
-| `CLAUDE_QUOTA_BAR_WIDTH` | `24` | Progress bar width in characters (6-40). |
+| `CLAUDE_QUOTA_BAR_WIDTH` | `18` | Progress bar width in characters (6-40). |
 | `CLAUDE_QUOTA_AUTH_PATH` | auto | Explicit path to OpenCode `auth.json` if auto-detection fails. |
 
 `auth.json` is auto-detected across Windows / macOS / Linux OpenCode install
