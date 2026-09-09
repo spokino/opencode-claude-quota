@@ -5,14 +5,14 @@ Show your **real** Claude subscription usage - the exact panel from
 weekly limits) - live in the **OpenCode TUI sidebar**.
 
 ```
-▼ ⚡ Claude usage 0.1.0
- Session (5h)          10%
+▼ ⚡ Claude usage 0.2.0
+ Session (5h) ·        10%
  ██░░░░░░░░░░░░░░░░  resets in 3m
  Weekly all             8%
  █░░░░░░░░░░░░░░░░░  resets in 5d 11h
  Weekly Fable           0%
  ░░░░░░░░░░░░░░░░░░
- updated 20:31:42
+ updated 20:31:42 · stale
 ```
 
 Unlike token-log estimators (ccusage etc.), this reads the **authoritative
@@ -70,9 +70,56 @@ Then reference the built file in `tui.json` with an **absolute** `file://` URL:
 
 ## Usage
 
-- The panel auto-refreshes every 90s.
+- The panel refreshes on an **adaptive interval** (see below) - roughly every
+  100-150s in steady state.
 - **`Alt+Q`** toggles the panel collapsed/expanded (state persists).
-- Bars are color-coded: green under 70%, yellow 70-90%, red 90%+.
+- Bars are color-coded: green under 70%, yellow 70-90%, red 90%+. When the
+  endpoint reports a `severity` for a row, that wins over the local thresholds.
+- A `·` after a row label marks the limit the server flags as currently active.
+- The footer shows the last successful fetch time, plus `· stale` when the most
+  recent refresh attempt failed.
+
+## Rate limiting and the adaptive interval
+
+The usage endpoint's 429 bucket is **per credential** and allows roughly **one
+request per ~90s**. A fixed 90s poll therefore sits exactly *on* the limit and
+fails intermittently: measured on 2026-09-09, it returned 429 on **2 of 7
+consecutive polls (~29%)**. Anything sharing the same OAuth token contends for
+that single budget.
+
+So the poll interval is **self-tuning (AIMD)** instead of fixed:
+
+| Behaviour | Value |
+|-----------|-------|
+| Starting interval | 150s |
+| After 3 consecutive successes | interval drops by 10s |
+| On a 429 | interval multiplied by 1.5 |
+| Floor / ceiling | 100s / 600s |
+
+It converges on the fastest cadence that does *not* get rate-limited, and
+self-heals if Anthropic retunes the limit. The current interval is **persisted
+in the shared cache**, so every instance agrees on it and it survives restarts.
+
+`Retry-After` is honoured only when it is **greater than 0**. The endpoint
+currently sends `Retry-After: 0`, which taken literally would mean "retry
+immediately" and re-trigger the limit.
+
+## Transient errors no longer blank the panel
+
+Previously any error - including a routine 429 - replaced the usage bars with
+an error message. That was the main user-visible bug, and it made the panel
+useless roughly a third of the time.
+
+Now errors are split in two:
+
+- **Transient** (429, 5xx, network blip) - the last-known numbers **stay on
+  screen** and the footer is marked `stale`. Quota moves by fractions of a
+  percent per minute, so slightly stale numbers beat no numbers.
+- **Terminal** (`no-token`, `auth expired`) - no amount of retrying helps until
+  you act, so these *do* replace the panel body.
+
+Non-429 failures (network drops, 5xx) additionally back off on a capped
+exponential ladder, up to 15 minutes.
 
 ## Configuration
 
@@ -80,10 +127,25 @@ Optional environment variables:
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `CLAUDE_QUOTA_POLL_MS` | `90000` | Refresh interval in ms (min 30000 - the endpoint rate-limits hard). |
+| `CLAUDE_QUOTA_POLL_MS` | unset (adaptive) | **Pins** the interval in ms and **disables adaptation** entirely (min 30000). See the behaviour change note below. |
 | `CLAUDE_QUOTA_BAR_WIDTH` | `18` | Progress bar width in characters (6-40). |
 | `CLAUDE_QUOTA_AUTH_PATH` | auto | Explicit path to OpenCode `auth.json` if auto-detection fails. |
 | `CLAUDE_QUOTA_CACHE_FILE` | temp dir | Path to the shared cross-instance cache file (see below). |
+| `CLAUDE_QUOTA_LOG` | enabled | Set to `0` to disable the debug log. |
+| `CLAUDE_QUOTA_LOG_FILE` | `<tmp>/opencode-claude-quota.log` | Debug log location. |
+
+> [!IMPORTANT]
+> **Behaviour change in 0.2.0:** `CLAUDE_QUOTA_POLL_MS` used to be simply the
+> poll period, layered on top of the built-in 90s default. It now **pins the
+> interval and turns AIMD off**, so the plugin will no longer back off on a 429
+> or speed up when the endpoint is healthy. Leave it unset unless you
+> specifically need deterministic timing.
+
+### Debug log
+
+The log records **status codes, latency and the current interval only** - never
+tokens, headers or response bodies. It lands in a world-readable temp dir by
+default, so nothing sensitive is written to it. It self-truncates at 256 KB.
 
 ## Multiple OpenCode instances
 
@@ -93,10 +155,21 @@ poll interval** - the rest render from the shared cache with no network call.
 All instances show the same, in-sync numbers, and you never trigger the
 endpoint's rate limit by multiplying requests.
 
-A soft lock (a short-lived "fetching" marker) prevents two instances from
-fetching at the same moment; if an instance dies mid-fetch, the lock expires
-after 15s and another takes over. Set `CLAUDE_QUOTA_CACHE_FILE` to override the
-cache location (e.g. to isolate profiles).
+Coordination is hardened as of 0.2.0:
+
+- **Atomic cache writes** - written to a per-pid temp file, then renamed over
+  the target, so readers can never see a half-written file.
+- **A real lock file** - created with an exclusive `wx` open, which actually
+  guarantees one winner. The previous read-check-write "soft lock" had no
+  exclusivity, so two instances could claim it simultaneously. A lock left
+  behind by an instance that died mid-fetch is taken over after 15s.
+- **A torn or unreadable cache now skips the tick** instead of being treated as
+  "no cache". Previously a torn read looked identical to a first run and
+  triggered a fetch, burning the single request the whole account gets per
+  interval.
+
+Set `CLAUDE_QUOTA_CACHE_FILE` to override the cache location (e.g. to isolate
+profiles).
 
 `auth.json` is auto-detected across Windows / macOS / Linux OpenCode install
 locations.
@@ -115,8 +188,9 @@ locations.
   (`/connect` or the Anthropic OAuth flow).
 - **"token expired - reopen OpenCode"** - the OAuth token lapsed; reopening
   OpenCode refreshes it.
-- **"rate limited"** - the endpoint returned 429; it will recover on the next
-  poll. Don't lower `CLAUDE_QUOTA_POLL_MS` below the floor.
+- **Footer says `stale`** - the last refresh hit a 429, a 5xx or a network
+  error. The numbers shown are the last good ones and the interval has already
+  backed off; it recovers on its own. Nothing to do.
 - **Panel doesn't appear** - confirm the entry is in `tui.json` (not
   `opencode.json`), the sidebar is visible, and (from source) the `file://`
   path is absolute and points at the built `dist/index.js`.

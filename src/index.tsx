@@ -10,25 +10,77 @@
 //
 // See README for the ToS note: this reads YOUR own quota with YOUR own token,
 // read-only, and stores nothing. Use at your own risk.
+//
+// ---------------------------------------------------------------------------
+// Rate limiting (measured 2026-09-09)
+// ---------------------------------------------------------------------------
+// The 429 bucket is PER CREDENTIAL and allows roughly ONE request per ~90s.
+// Evidence: at a fixed 90s cadence the plugin 429'd on 2 of 7 consecutive
+// polls (~29%). A second consumer using the same OAuth token 429'd on 4 of 4
+// probes spaced 100s apart, while the plugin kept succeeding - i.e. the two
+// contend for one shared budget. A browser session cookie has its own,
+// separate bucket.
+//
+// Two consequences drive the design below:
+//   1. A fixed 90s poll sits exactly ON the limit, so it fails intermittently.
+//      -> The interval is now self-tuning (AIMD), converging on the fastest
+//         rate that does NOT 429.
+//   2. Quota percentages move by fractions of a percent per minute, so hiding
+//      cached numbers behind a transient "rate limited" message is strictly
+//      worse than showing slightly stale data.
+//      -> Transient errors NEVER replace the panel body.
 import { createRoot, createSignal, onCleanup } from "solid-js";
 import { jsx, jsxs } from "@opentui/solid/jsx-runtime";
-import { readFileSync, writeFileSync } from "node:fs";
+import {
+  appendFileSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
-const VERSION = "0.1.0";
+const VERSION = "0.2.0";
 
-// The endpoint rate-limits aggressively (HTTP 429, no Retry-After).
-// Do not poll faster than ~90s. Overridable via CLAUDE_QUOTA_POLL_MS.
-const POLL_MS = Math.max(
-  30_000,
-  Number(process.env.CLAUDE_QUOTA_POLL_MS) || 90_000,
-);
 const USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
+
+// --- Adaptive poll interval (AIMD) -----------------------------------------
+// Start comfortably above the measured limit, then creep down while the
+// endpoint keeps saying yes, and back off multiplicatively when it says no.
+// This finds the fastest sustainable rate without hard-coding a guess, and
+// self-heals if Anthropic retunes the limit.
+const INTERVAL_START_MS = 150_000;
+// 90s is measured to fail ~29% of the time, so never go below 100s.
+const INTERVAL_FLOOR_MS = 100_000;
+const INTERVAL_CEIL_MS = 600_000;
+const INTERVAL_STEP_DOWN_MS = 10_000;
+const OK_STREAK_TO_SPEED_UP = 3;
+const BACKOFF_FACTOR = 1.5;
+
+// Setting CLAUDE_QUOTA_POLL_MS pins the interval and DISABLES adaptation,
+// for anyone who wants deterministic behaviour.
+const rawFixedPoll = Number(process.env.CLAUDE_QUOTA_POLL_MS);
+const FIXED_POLL_MS =
+  Number.isFinite(rawFixedPoll) && rawFixedPoll > 0
+    ? Math.max(30_000, rawFixedPoll)
+    : undefined;
+
 const BAR_WIDTH = Math.max(
   6,
   Math.min(40, Number(process.env.CLAUDE_QUOTA_BAR_WIDTH) || 18),
 );
+
+// How long another instance's lock file is honored before we assume it died
+// mid-fetch and take over.
+const LOCK_TTL_MS = 15_000;
+// Ceiling for the exponential ladder used by NON-429 failures (network drops,
+// 5xx). 429s do not use this ladder - the adaptive interval absorbs them.
+const MAX_BACKOFF_MS = 15 * 60_000;
+// Display refresh. Decoupled from the poll interval: a short tick only syncs
+// the display with the SHARED cache, it does not cause network calls.
+const TICK_MS = 5_000;
 
 // OpenCode auth.json locations, first match wins. Covers Windows, macOS, Linux.
 const AUTH_PATHS = [
@@ -60,6 +112,33 @@ function readAuth(): Auth | undefined {
   return undefined;
 }
 
+// --- Debug log --------------------------------------------------------------
+// Status codes, timings and interval only. NEVER the token, headers or any
+// response body - this file lands in a world-readable temp dir.
+const LOG_FILE =
+  process.env.CLAUDE_QUOTA_LOG_FILE ||
+  join(tmpdir(), "opencode-claude-quota.log");
+const LOG_MAX_BYTES = 256 * 1024;
+const LOG_ENABLED = process.env.CLAUDE_QUOTA_LOG !== "0";
+
+function log(line: string): void {
+  if (!LOG_ENABLED) return;
+  try {
+    try {
+      if (statSync(LOG_FILE).size > LOG_MAX_BYTES) unlinkSync(LOG_FILE);
+    } catch {
+      /* no log yet */
+    }
+    appendFileSync(
+      LOG_FILE,
+      `[${new Date().toISOString()}] pid=${process.pid} ${line}\n`,
+      "utf8",
+    );
+  } catch {
+    /* logging must never break the panel */
+  }
+}
+
 function fmtReset(iso?: string | null): string {
   if (!iso) return "";
   const t = new Date(iso).getTime();
@@ -80,7 +159,13 @@ function bar(percent: number): string {
   return "\u2588".repeat(filled) + "\u2591".repeat(BAR_WIDTH - filled);
 }
 
-type Row = { label: string; percent: number; reset: string };
+type Row = {
+  label: string;
+  percent: number;
+  reset: string;
+  severity?: string;
+  active?: boolean;
+};
 
 function labelFor(kind: string, scope: any): string {
   if (kind === "session") return "Session (5h)";
@@ -91,10 +176,32 @@ function labelFor(kind: string, scope: any): string {
   return kind;
 }
 
-// Raw fetch of the live endpoint. Returns rows + the fetch timestamp.
+// --- Error taxonomy ---------------------------------------------------------
+// terminal  = no amount of retrying helps until the user acts (no login,
+//             expired token). Worth replacing the panel body with.
+// transient = rate limit, network blip, 5xx. Cached numbers stay on screen.
+type ErrorKind = "terminal" | "transient";
+
+class UsageError extends Error {
+  kind: ErrorKind;
+  rateLimited: boolean;
+  retryAfterMs?: number;
+  constructor(
+    message: string,
+    kind: ErrorKind,
+    opts?: { rateLimited?: boolean; retryAfterMs?: number },
+  ) {
+    super(message);
+    this.kind = kind;
+    this.rateLimited = opts?.rateLimited ?? false;
+    this.retryAfterMs = opts?.retryAfterMs;
+  }
+}
+
+// Raw fetch of the live endpoint.
 async function fetchUsageRaw(): Promise<Row[]> {
   const auth = readAuth();
-  if (!auth) throw new Error("no-token");
+  if (!auth) throw new UsageError("no-token", "terminal");
 
   const res = await fetch(USAGE_URL, {
     headers: {
@@ -102,9 +209,21 @@ async function fetchUsageRaw(): Promise<Row[]> {
       "anthropic-beta": "oauth-2025-04-20",
     },
   });
-  if (res.status === 429) throw new Error("rate limited");
-  if (res.status === 401 || res.status === 403) throw new Error("auth expired");
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+  if (res.status === 429) {
+    // The endpoint currently sends "Retry-After: 0", which taken literally
+    // would mean "retry immediately" and re-trigger the limit. Only honor a
+    // positive value.
+    const ra = Number(res.headers.get("retry-after"));
+    throw new UsageError("rate limited", "transient", {
+      rateLimited: true,
+      retryAfterMs: Number.isFinite(ra) && ra > 0 ? ra * 1000 : undefined,
+    });
+  }
+  if (res.status === 401 || res.status === 403) {
+    throw new UsageError("auth expired", "terminal");
+  }
+  if (!res.ok) throw new UsageError(`HTTP ${res.status}`, "transient");
 
   const data: any = await res.json();
   const rows: Row[] = [];
@@ -115,6 +234,10 @@ async function fetchUsageRaw(): Promise<Row[]> {
         label: labelFor(l.kind, l.scope),
         percent: Number(l.percent) || 0,
         reset: fmtReset(l.resets_at),
+        // Optional server-driven fields. Absent on older responses, in which
+        // case rendering falls back to local percentage thresholds.
+        severity: typeof l.severity === "string" ? l.severity : undefined,
+        active: l.is_active === true,
       });
     }
   } else {
@@ -134,78 +257,236 @@ async function fetchUsageRaw(): Promise<Row[]> {
   return rows;
 }
 
-// ---- Shared cross-instance cache (so N OpenCode instances = 1 fetch/interval) ----
+// ---- Shared cross-instance cache (so N OpenCode instances = 1 fetch/interval)
 // All instances share one JSON file in the OS temp dir. Each instance, on its
-// tick, reads the file: if fresh (< POLL_MS old) it just renders the cached
-// rows and makes NO network call. If stale, a soft "fetching" lock (a recent
-// timestamp) lets exactly one instance do the fetch while others wait. The
-// small race window (two instances claiming within the same few ms) is
-// harmless - worst case an occasional double fetch, still far below N/interval.
+// tick, reads the file: if fresh it just renders the cached rows and makes NO
+// network call. If stale, an exclusive lock file lets exactly one instance do
+// the fetch while the others render cached data.
 const CACHE_FILE =
   process.env.CLAUDE_QUOTA_CACHE_FILE ||
   join(tmpdir(), "opencode-claude-quota-cache.json");
-// How long another instance's "fetching" marker is honored before we assume it
-// died mid-fetch and take over.
-const LOCK_TTL_MS = 15_000;
+const LOCK_FILE = `${CACHE_FILE}.lock`;
 
 type Cache = {
   rows?: Row[];
   fetchedAt?: number; // ms epoch of last successful fetch
-  error?: string; // last error, if the last attempt failed
-  fetchingAt?: number; // ms epoch when an instance claimed the fetch lock
+  error?: string; // last error message, if the last attempt failed
+  errorKind?: ErrorKind; // decides whether the panel body is replaced
+  cooldownUntil?: number; // ms epoch: do not attempt another fetch before this
+  failures?: number; // consecutive NON-429 failures, drives exponential ladder
+  intervalMs?: number; // adaptive poll interval, shared by all instances
+  okStreak?: number; // consecutive successes, drives the speed-up
 };
 
-function readCache(): Cache {
+type CacheRead =
+  | { state: "ok"; cache: Cache }
+  | { state: "missing" }
+  | { state: "unreadable" };
+
+function readCache(): CacheRead {
+  let raw: string;
   try {
-    return JSON.parse(readFileSync(CACHE_FILE, "utf8")) as Cache;
+    raw = readFileSync(CACHE_FILE, "utf8");
   } catch {
-    return {};
+    // Genuinely absent - first run. Fetching is the correct response.
+    return { state: "missing" };
+  }
+  try {
+    return { state: "ok", cache: JSON.parse(raw) as Cache };
+  } catch {
+    // The file exists but did not parse. Previously this was indistinguishable
+    // from "no cache", so a torn read made an instance fetch and burn the one
+    // request the whole account gets per interval. Now we skip the tick.
+    return { state: "unreadable" };
   }
 }
 
+// Atomic: write a per-pid temp file, then rename over the target. Prevents the
+// torn reads that the multi-instance setup would otherwise produce.
 function writeCache(c: Cache): void {
+  const tmp = `${CACHE_FILE}.${process.pid}.tmp`;
   try {
-    writeFileSync(CACHE_FILE, JSON.stringify(c), "utf8");
+    writeFileSync(tmp, JSON.stringify(c), "utf8");
+    renameSync(tmp, CACHE_FILE);
   } catch {
-    /* best-effort; if temp is unwritable we just fall back to per-instance */
+    try {
+      unlinkSync(tmp);
+    } catch {
+      /* nothing else to do */
+    }
   }
 }
 
-type Result = { rows: Row[]; error: string; fetchedAt?: number };
+// Real mutex via exclusive create. The old read-check-write sequence had no
+// exclusivity, so instances could claim it simultaneously.
+function acquireLock(now: number): boolean {
+  try {
+    writeFileSync(LOCK_FILE, String(now), { flag: "wx" });
+    return true;
+  } catch {
+    /* held by someone - fall through to the staleness check */
+  }
+  try {
+    if (now - statSync(LOCK_FILE).mtimeMs > LOCK_TTL_MS) {
+      // Previous holder died mid-fetch. Take over.
+      unlinkSync(LOCK_FILE);
+      writeFileSync(LOCK_FILE, String(now), { flag: "wx" });
+      log("lock: took over stale lock");
+      return true;
+    }
+  } catch {
+    /* another instance won the takeover race */
+  }
+  return false;
+}
+
+function releaseLock(): void {
+  try {
+    unlinkSync(LOCK_FILE);
+  } catch {
+    /* already gone */
+  }
+}
+
+function currentInterval(cache: Cache): number {
+  if (FIXED_POLL_MS) return FIXED_POLL_MS;
+  const v = Number(cache.intervalMs);
+  if (!Number.isFinite(v) || v <= 0) return INTERVAL_START_MS;
+  return Math.max(INTERVAL_FLOOR_MS, Math.min(INTERVAL_CEIL_MS, v));
+}
+
+type Result = {
+  skip?: boolean; // cache unreadable this tick - leave the display untouched
+  rows: Row[];
+  error: string;
+  errorKind?: ErrorKind;
+  fetchedAt?: number;
+  stale: boolean;
+};
+
+function fromCache(cache: Cache, stale: boolean): Result {
+  return {
+    rows: cache.rows ?? [],
+    error: cache.error ?? "",
+    errorKind: cache.errorKind,
+    fetchedAt: cache.fetchedAt,
+    stale,
+  };
+}
 
 // Returns the freshest data for rendering, fetching only when needed and only
 // from one instance at a time.
 async function getUsage(): Promise<Result> {
   const now = Date.now();
-  const cache = readCache();
+  const read = readCache();
+
+  if (read.state === "unreadable") {
+    return { skip: true, rows: [], error: "", stale: false };
+  }
+
+  const cache: Cache = read.state === "ok" ? read.cache : {};
+  const interval = currentInterval(cache);
 
   // 1. Cache is fresh -> render it, no network.
-  if (cache.fetchedAt && now - cache.fetchedAt < POLL_MS && cache.rows) {
-    return { rows: cache.rows, error: cache.error ?? "", fetchedAt: cache.fetchedAt };
+  if (cache.fetchedAt && now - cache.fetchedAt < interval && cache.rows) {
+    return fromCache(cache, false);
   }
 
-  // 2. Cache is stale. Is another instance already fetching (recent lock)?
-  if (cache.fetchingAt && now - cache.fetchingAt < LOCK_TTL_MS) {
-    // Someone else is on it. Show whatever we have (may be slightly stale).
-    return {
-      rows: cache.rows ?? [],
-      error: cache.rows ? (cache.error ?? "") : "refreshing...",
-      fetchedAt: cache.fetchedAt,
-    };
+  // 2. In a cooldown -> do NOT hit the network; render last data.
+  if (cache.cooldownUntil && now < cache.cooldownUntil) {
+    return fromCache(cache, true);
   }
 
-  // 3. Claim the soft lock and fetch.
-  writeCache({ ...cache, fetchingAt: now });
+  // 3. Cache is stale but another instance is already fetching.
+  if (!acquireLock(now)) {
+    return fromCache(cache, true);
+  }
+
+  // 4. We hold the lock. Fetch.
+  const started = Date.now();
   try {
     const rows = await fetchUsageRaw();
     const fetchedAt = Date.now();
-    writeCache({ rows, fetchedAt, error: "", fetchingAt: undefined });
-    return { rows, error: "", fetchedAt };
+    const ms = fetchedAt - started;
+
+    // Additive decrease of the interval: after a run of successes, try going
+    // a little faster next time.
+    let okStreak = (cache.okStreak ?? 0) + 1;
+    let intervalMs = interval;
+    if (!FIXED_POLL_MS && okStreak >= OK_STREAK_TO_SPEED_UP) {
+      intervalMs = Math.max(INTERVAL_FLOOR_MS, interval - INTERVAL_STEP_DOWN_MS);
+      okStreak = 0;
+    }
+
+    writeCache({
+      rows,
+      fetchedAt,
+      error: "",
+      errorKind: undefined,
+      cooldownUntil: undefined,
+      failures: 0,
+      intervalMs,
+      okStreak,
+    });
+    log(`fetch ok in ${ms}ms; interval ${interval}ms -> ${intervalMs}ms; okStreak=${okStreak}`);
+    return { rows, error: "", fetchedAt, stale: false };
   } catch (e: any) {
-    const error = e?.message ?? "fetch failed";
-    // Keep the last good rows if we have them; record the error; clear lock.
-    writeCache({ ...cache, error, fetchingAt: undefined });
-    return { rows: cache.rows ?? [], error, fetchedAt: cache.fetchedAt };
+    const err: UsageError =
+      e instanceof UsageError
+        ? e
+        : new UsageError(e?.message ?? "fetch failed", "transient");
+    const ms = Date.now() - started;
+
+    let intervalMs = interval;
+    let cooldownUntil: number;
+    let failures = cache.failures ?? 0;
+
+    if (err.rateLimited) {
+      // Multiplicative increase. The interval itself carries the throttle, so
+      // there is no separate exponential ladder to climb here.
+      if (!FIXED_POLL_MS) {
+        intervalMs = Math.min(
+          INTERVAL_CEIL_MS,
+          Math.round(interval * BACKOFF_FACTOR),
+        );
+      }
+      cooldownUntil = now + (err.retryAfterMs ?? intervalMs);
+      failures = 0;
+    } else if (err.kind === "terminal") {
+      // Nothing will change until the user re-authenticates. Check back at the
+      // normal interval rather than hammering.
+      cooldownUntil = now + interval;
+      failures = 0;
+    } else {
+      // Network drop / 5xx: exponential ladder, capped.
+      failures += 1;
+      cooldownUntil =
+        now + Math.min(interval * 2 ** (failures - 1), MAX_BACKOFF_MS);
+    }
+
+    writeCache({
+      ...cache,
+      error: err.message,
+      errorKind: err.kind,
+      cooldownUntil,
+      failures,
+      intervalMs,
+      okStreak: 0,
+    });
+    log(
+      `fetch FAIL "${err.message}" (${err.kind}) after ${ms}ms; ` +
+        `interval ${interval}ms -> ${intervalMs}ms; ` +
+        `cooldown ${Math.round((cooldownUntil - now) / 1000)}s`,
+    );
+    return {
+      rows: cache.rows ?? [],
+      error: err.message,
+      errorKind: err.kind,
+      fetchedAt: cache.fetchedAt,
+      stale: true,
+    };
+  } finally {
+    releaseLock();
   }
 }
 
@@ -215,9 +496,16 @@ const tui = async (api: any) => {
   if (initialized) return;
   initialized = true;
 
+  log(
+    `start v${VERSION}; cache=${CACHE_FILE}; ` +
+      `mode=${FIXED_POLL_MS ? `fixed ${FIXED_POLL_MS}ms` : "adaptive"}`,
+  );
+
   createRoot(() => {
     const [rows, setRows] = createSignal<Row[]>([]);
-    const [err, setErr] = createSignal<string>("");
+    // notice = a terminal problem worth replacing the panel with.
+    const [notice, setNotice] = createSignal<string>("");
+    const [stale, setStale] = createSignal<boolean>(false);
     const [updated, setUpdated] = createSignal<string>("");
 
     const EXPANDED_KV = "claude-quota.expanded";
@@ -233,17 +521,28 @@ const tui = async (api: any) => {
 
     async function refresh() {
       const res = await getUsage();
+      // Cache was mid-write. Leave the display exactly as it is.
+      if (res.skip) return;
+
       if (res.rows.length) setRows(res.rows);
-      setErr(res.error ? prettyErr(res.error) : "");
+
+      // The whole point of the rewrite: a transient error (429, 5xx, network
+      // blip) must NEVER blank the panel. We already hold numbers that are at
+      // most one interval old, and quota moves by fractions of a percent per
+      // minute. Only a terminal error - where no data will ever arrive -
+      // replaces the body.
+      const terminal = res.errorKind === "terminal";
+      const nothingToShow = res.rows.length === 0;
+      setNotice(
+        res.error && (terminal || nothingToShow) ? prettyErr(res.error) : "",
+      );
+      setStale(res.stale && res.rows.length > 0);
+
       if (res.fetchedAt) {
         setUpdated(new Date(res.fetchedAt).toLocaleTimeString());
       }
     }
 
-    // Tick often enough to pick up another instance's fresh cache promptly.
-    // getUsage() only hits the network when the SHARED cache is stale, so a
-    // short tick does NOT increase fetch volume - it just syncs the display.
-    const TICK_MS = Math.min(5_000, POLL_MS);
     refresh();
     const timer = setInterval(refresh, TICK_MS);
     onCleanup(() => clearInterval(timer));
@@ -271,6 +570,25 @@ const tui = async (api: any) => {
         sidebar_content(ctx: any) {
           const theme = ctx.theme.current;
 
+          function colorFor(r: Row) {
+            // Prefer the server's own severity when the endpoint provides it.
+            switch (r.severity) {
+              case "critical":
+              case "error":
+                return theme.error ?? theme.text;
+              case "warning":
+              case "warn":
+                return theme.warning ?? theme.text;
+              case "normal":
+                return theme.success ?? theme.text;
+            }
+            return r.percent >= 90
+              ? (theme.error ?? theme.text)
+              : r.percent >= 70
+                ? (theme.warning ?? theme.text)
+                : (theme.success ?? theme.text);
+          }
+
           const header = jsxs("box", {
             flexDirection: "row",
             justifyContent: "space-between",
@@ -295,18 +613,13 @@ const tui = async (api: any) => {
             return jsx("box", { flexDirection: "column", children: [header] });
 
           let body: any;
-          if (err()) {
-            body = jsx("text", { fg: theme.textMuted, children: ` ${err()}` });
+          if (notice()) {
+            body = jsx("text", { fg: theme.textMuted, children: ` ${notice()}` });
           } else if (rows().length === 0) {
             body = jsx("text", { fg: theme.textMuted, children: " loading..." });
           } else {
             body = rows().map((r) => {
-              const color =
-                r.percent >= 90
-                  ? (theme.error ?? theme.text)
-                  : r.percent >= 70
-                    ? (theme.warning ?? theme.text)
-                    : (theme.success ?? theme.text);
+              const color = colorFor(r);
               return jsxs("box", {
                 flexDirection: "column",
                 children: [
@@ -314,7 +627,10 @@ const tui = async (api: any) => {
                     flexDirection: "row",
                     justifyContent: "space-between",
                     children: [
-                      jsx("text", { fg: theme.text, children: ` ${r.label}` }),
+                      jsx("text", {
+                        fg: theme.text,
+                        children: ` ${r.label}${r.active ? " \u00B7" : ""}`,
+                      }),
                       jsx("text", {
                         fg: color,
                         children: `${Math.round(r.percent)}%`,
@@ -334,10 +650,11 @@ const tui = async (api: any) => {
             });
           }
 
+          // Staleness is surfaced here rather than by hiding the numbers.
           const footer = updated()
             ? jsx("text", {
                 fg: theme.textMuted,
-                children: ` updated ${updated()}`,
+                children: ` updated ${updated()}${stale() ? " \u00B7 stale" : ""}`,
               })
             : null;
 
@@ -356,3 +673,21 @@ const tui = async (api: any) => {
 };
 
 export default { id: "claude-quota", tui };
+
+// Internals exposed for the test harness only. OpenCode loads the default
+// export; this named export is inert at runtime.
+export const __internals = {
+  getUsage,
+  readCache,
+  writeCache,
+  acquireLock,
+  releaseLock,
+  currentInterval,
+  UsageError,
+  CACHE_FILE,
+  LOCK_FILE,
+  INTERVAL_START_MS,
+  INTERVAL_FLOOR_MS,
+  INTERVAL_CEIL_MS,
+  OK_STREAK_TO_SPEED_UP,
+};
