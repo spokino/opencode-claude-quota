@@ -5,7 +5,7 @@ Show your **real** Claude subscription usage - the exact panel from
 weekly limits) - live in the **OpenCode TUI sidebar**.
 
 ```
-▼ ⚡ Claude usage 0.2.0
+▼ ⚡ Claude usage 0.2.1
  Session (5h) ·        10%
  ██░░░░░░░░░░░░░░░░  resets in 3m
  Weekly all             8%
@@ -129,6 +129,8 @@ Optional environment variables:
 |----------|---------|---------|
 | `CLAUDE_QUOTA_POLL_MS` | unset (adaptive) | **Pins** the interval in ms and **disables adaptation** entirely (min 30000). See the behaviour change note below. |
 | `CLAUDE_QUOTA_BAR_WIDTH` | `18` | Progress bar width in characters (6-40). |
+| `CLAUDE_QUOTA_HIDE` | unset | Comma-separated, case-insensitive **substring** match against the row label; matching rows are not rendered. E.g. `Fable`. |
+| `CLAUDE_QUOTA_HIDE_ZERO` | unset | Set to `1` to hide any row sitting at exactly 0%. |
 | `CLAUDE_QUOTA_AUTH_PATH` | auto | Explicit path to OpenCode `auth.json` if auto-detection fails. |
 | `CLAUDE_QUOTA_CACHE_FILE` | temp dir | Path to the shared cross-instance cache file (see below). |
 | `CLAUDE_QUOTA_LOG` | enabled | Set to `0` to disable the debug log. |
@@ -140,6 +142,28 @@ Optional environment variables:
 > interval and turns AIMD off**, so the plugin will no longer back off on a 429
 > or speed up when the endpoint is healthy. Leave it unset unless you
 > specifically need deterministic timing.
+
+### Hiding rows
+
+The endpoint always returns **every** scoped weekly bucket, including models you
+never touch - so `Weekly Fable` can sit permanently at 0% and eat two lines of
+sidebar. `CLAUDE_QUOTA_HIDE` drops rows by label substring, and
+`CLAUDE_QUOTA_HIDE_ZERO=1` drops anything at exactly 0%:
+
+```bash
+CLAUDE_QUOTA_HIDE=Fable
+CLAUDE_QUOTA_HIDE_ZERO=1
+```
+
+Filtering happens at **render time, not fetch time**. The shared cross-instance
+cache therefore stays canonical - it always holds the full response - so
+instances configured with different filters still agree on the underlying
+numbers and continue to share a single fetch per interval. Changing these
+variables never invalidates the cache or costs an extra request.
+
+If every row ends up filtered out, the panel renders ` all rows hidden` rather
+than an empty box, so a too-aggressive filter is obvious instead of looking like
+a broken plugin.
 
 ### Debug log
 

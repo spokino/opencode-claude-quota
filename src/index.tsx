@@ -42,7 +42,7 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
-const VERSION = "0.2.0";
+const VERSION = "0.2.1";
 
 const USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
 
@@ -71,6 +71,23 @@ const BAR_WIDTH = Math.max(
   6,
   Math.min(40, Number(process.env.CLAUDE_QUOTA_BAR_WIDTH) || 18),
 );
+
+// Rows worth hiding. The endpoint always returns every scoped weekly bucket,
+// including models the user never touches (e.g. "Weekly Fable" pinned at 0%).
+// CLAUDE_QUOTA_HIDE is a comma-separated, case-insensitive substring match
+// against the rendered label. CLAUDE_QUOTA_HIDE_ZERO=1 additionally drops any
+// row sitting at exactly 0%.
+const HIDE_PATTERNS = (process.env.CLAUDE_QUOTA_HIDE ?? "")
+  .split(",")
+  .map((s) => s.trim().toLowerCase())
+  .filter(Boolean);
+const HIDE_ZERO = process.env.CLAUDE_QUOTA_HIDE_ZERO === "1";
+
+function isHidden(r: Row): boolean {
+  if (HIDE_ZERO && Math.round(r.percent) === 0) return true;
+  const label = r.label.toLowerCase();
+  return HIDE_PATTERNS.some((p) => label.includes(p));
+}
 
 // How long another instance's lock file is honored before we assume it died
 // mid-fetch and take over.
@@ -612,13 +629,19 @@ const tui = async (api: any) => {
           if (!expanded())
             return jsx("box", { flexDirection: "column", children: [header] });
 
+          // Filtering happens at render time, not at fetch time: the shared
+          // cache stays canonical so instances with different settings agree.
+          const visible = rows().filter((r) => !isHidden(r));
+
           let body: any;
           if (notice()) {
             body = jsx("text", { fg: theme.textMuted, children: ` ${notice()}` });
           } else if (rows().length === 0) {
             body = jsx("text", { fg: theme.textMuted, children: " loading..." });
+          } else if (visible.length === 0) {
+            body = jsx("text", { fg: theme.textMuted, children: " all rows hidden" });
           } else {
-            body = rows().map((r) => {
+            body = visible.map((r) => {
               const color = colorFor(r);
               return jsxs("box", {
                 flexDirection: "column",
@@ -684,6 +707,9 @@ export const __internals = {
   releaseLock,
   currentInterval,
   UsageError,
+  isHidden,
+  HIDE_PATTERNS,
+  HIDE_ZERO,
   CACHE_FILE,
   LOCK_FILE,
   INTERVAL_START_MS,
