@@ -42,7 +42,7 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
-const VERSION = "0.2.1";
+const VERSION = "0.2.2";
 
 const USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
 
@@ -95,6 +95,24 @@ const LOCK_TTL_MS = 15_000;
 // Ceiling for the exponential ladder used by NON-429 failures (network drops,
 // 5xx). 429s do not use this ladder - the adaptive interval absorbs them.
 const MAX_BACKOFF_MS = 15 * 60_000;
+// Hard ceiling on ANY cooldown, including a server-supplied Retry-After.
+// The endpoint has been observed returning "Retry-After: 3600" (one hour);
+// honouring that verbatim froze the panel for an hour. A quota panel is worth
+// re-checking far sooner than the server's worst-case hint suggests.
+const MAX_COOLDOWN_MS = 10 * 60_000;
+// How long to wait before re-reading auth.json after finding an expired token.
+// This costs no network call, so it can be short - the moment OpenCode
+// refreshes the token the panel recovers.
+const AUTH_RECHECK_MS = 30_000;
+// Treat the token as dead slightly before its stated expiry, to avoid firing a
+// request that will land after it lapses.
+const AUTH_SKEW_MS = 60_000;
+// Data older than this is called out visibly instead of hidden behind a
+// one-word "stale" marker.
+const STALE_ALERT_MS = 15 * 60_000;
+// A persistently unparseable cache must not wedge every instance forever.
+// After this many consecutive unreadable reads, overwrite it.
+const MAX_UNREADABLE_STREAK = 5;
 // Display refresh. Decoupled from the poll interval: a short tick only syncs
 // the display with the SHARED cache, it does not cause network calls.
 const TICK_MS = 5_000;
@@ -168,6 +186,17 @@ function fmtReset(iso?: string | null): string {
   if (h < 24) return `resets in ${h}h ${m % 60}m`;
   const d = Math.floor(h / 24);
   return `resets in ${d}d ${h % 24}h`;
+}
+
+// "3m" / "1h 12m" / "6h". Used to state how old the numbers actually are - a
+// bare "stale" marker once hid a six-hour gap.
+function fmtAge(ms: number): string {
+  const m = Math.floor(ms / 60000);
+  if (m < 1) return "just now";
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return m % 60 ? `${h}h ${m % 60}m` : `${h}h`;
+  return `${Math.floor(h / 24)}d ${h % 24}h`;
 }
 
 function bar(percent: number): string {
@@ -309,7 +338,10 @@ function readCache(): CacheRead {
     return { state: "missing" };
   }
   try {
-    return { state: "ok", cache: JSON.parse(raw) as Cache };
+    // Tolerate a UTF-8 BOM. Anything that hand-edits this file on Windows
+    // (PowerShell 5.1's `Set-Content -Encoding utf8`, most notably) prepends
+    // one, and JSON.parse rejects it - which used to wedge every instance.
+    return { state: "ok", cache: JSON.parse(raw.replace(/^\uFEFF/, "")) as Cache };
   } catch {
     // The file exists but did not parse. Previously this was indistinguishable
     // from "no cache", so a torn read made an instance fetch and burn the one
@@ -391,6 +423,10 @@ function fromCache(cache: Cache, stale: boolean): Result {
   };
 }
 
+// Consecutive unreadable cache reads. Skipping the tick is the right response
+// to a torn read, but a permanently corrupt file must not wedge us forever.
+let unreadableStreak = 0;
+
 // Returns the freshest data for rendering, fetching only when needed and only
 // from one instance at a time.
 async function getUsage(): Promise<Result> {
@@ -398,7 +434,15 @@ async function getUsage(): Promise<Result> {
   const read = readCache();
 
   if (read.state === "unreadable") {
-    return { skip: true, rows: [], error: "", stale: false };
+    unreadableStreak += 1;
+    if (unreadableStreak <= MAX_UNREADABLE_STREAK) {
+      return { skip: true, rows: [], error: "", stale: false };
+    }
+    // Escape hatch: the file is not merely being written, it is broken.
+    // Fall through and treat it as missing so the next write repairs it.
+    log(`cache unreadable x${unreadableStreak} - overwriting`);
+  } else {
+    unreadableStreak = 0;
   }
 
   const cache: Cache = read.state === "ok" ? read.cache : {};
@@ -414,7 +458,25 @@ async function getUsage(): Promise<Result> {
     return fromCache(cache, true);
   }
 
-  // 3. Cache is stale but another instance is already fetching.
+  // 3. Local pre-flight on the token. auth.json carries an `expires` stamp, so
+  // a dead token can be detected for free. Firing the request anyway is worse
+  // than useless: it cannot succeed, and it spends one of the very few
+  // requests the endpoint allows. That is exactly how an overnight token
+  // lapse escalated into an hour-long 429 lockout.
+  const auth = readAuth();
+  if (!auth) {
+    writeCache({ ...cache, error: "no-token", errorKind: "terminal", cooldownUntil: now + AUTH_RECHECK_MS });
+    return { rows: cache.rows ?? [], error: "no-token", errorKind: "terminal", fetchedAt: cache.fetchedAt, stale: true };
+  }
+  if (auth.expires && auth.expires - AUTH_SKEW_MS < now) {
+    // No network call. Re-check soon: OpenCode rewrites auth.json as soon as
+    // it makes any inference call, and we pick that up on the next tick.
+    writeCache({ ...cache, error: "auth expired", errorKind: "terminal", cooldownUntil: now + AUTH_RECHECK_MS });
+    log(`token expired locally - skipping fetch, recheck in ${AUTH_RECHECK_MS / 1000}s`);
+    return { rows: cache.rows ?? [], error: "auth expired", errorKind: "terminal", fetchedAt: cache.fetchedAt, stale: true };
+  }
+
+  // 4. Cache is stale but another instance is already fetching.
   if (!acquireLock(now)) {
     return fromCache(cache, true);
   }
@@ -467,7 +529,10 @@ async function getUsage(): Promise<Result> {
           Math.round(interval * BACKOFF_FACTOR),
         );
       }
-      cooldownUntil = now + (err.retryAfterMs ?? intervalMs);
+      // Clamp the server hint. A Retry-After of 3600 has been observed in the
+      // wild; obeying it literally froze the panel for a full hour even after
+      // the underlying problem had cleared.
+      cooldownUntil = now + Math.min(err.retryAfterMs ?? intervalMs, MAX_COOLDOWN_MS);
       failures = 0;
     } else if (err.kind === "terminal") {
       // Nothing will change until the user re-authenticates. Check back at the
@@ -480,6 +545,10 @@ async function getUsage(): Promise<Result> {
       cooldownUntil =
         now + Math.min(interval * 2 ** (failures - 1), MAX_BACKOFF_MS);
     }
+
+    // Defence in depth: whatever the branch above decided, never park the
+    // panel for longer than MAX_COOLDOWN_MS.
+    cooldownUntil = Math.min(cooldownUntil, now + MAX_COOLDOWN_MS);
 
     writeCache({
       ...cache,
@@ -520,10 +589,16 @@ const tui = async (api: any) => {
 
   createRoot(() => {
     const [rows, setRows] = createSignal<Row[]>([]);
-    // notice = a terminal problem worth replacing the panel with.
+    // notice = there is nothing to show at all, so this replaces the body.
     const [notice, setNotice] = createSignal<string>("");
+    // warn = we DO have numbers, but something is wrong with them. Rendered as
+    // an extra line under the rows so the data stays visible and explained.
+    const [warn, setWarn] = createSignal<string>("");
     const [stale, setStale] = createSignal<boolean>(false);
     const [updated, setUpdated] = createSignal<string>("");
+    // Kept as a raw timestamp so the rendered age recomputes on every tick
+    // rather than freezing at whatever it was when the fetch failed.
+    const [updatedAt, setUpdatedAt] = createSignal<number>(0);
 
     const EXPANDED_KV = "claude-quota.expanded";
     const [expanded, setExpanded] = createSignal(
@@ -543,20 +618,19 @@ const tui = async (api: any) => {
 
       if (res.rows.length) setRows(res.rows);
 
-      // The whole point of the rewrite: a transient error (429, 5xx, network
-      // blip) must NEVER blank the panel. We already hold numbers that are at
-      // most one interval old, and quota moves by fractions of a percent per
-      // minute. Only a terminal error - where no data will ever arrive -
-      // replaces the body.
-      const terminal = res.errorKind === "terminal";
+      // No error must ever blank a panel that has numbers in it. If we have
+      // rows, they stay on screen and the problem is reported alongside them;
+      // only a completely empty panel gets replaced by the message. An earlier
+      // version replaced the body on any terminal error, which hid perfectly
+      // good figures behind "token expired".
       const nothingToShow = res.rows.length === 0;
-      setNotice(
-        res.error && (terminal || nothingToShow) ? prettyErr(res.error) : "",
-      );
+      setNotice(res.error && nothingToShow ? prettyErr(res.error) : "");
+      setWarn(res.error && !nothingToShow ? prettyErr(res.error) : "");
       setStale(res.stale && res.rows.length > 0);
 
       if (res.fetchedAt) {
         setUpdated(new Date(res.fetchedAt).toLocaleTimeString());
+        setUpdatedAt(res.fetchedAt);
       }
     }
 
@@ -673,11 +747,24 @@ const tui = async (api: any) => {
             });
           }
 
-          // Staleness is surfaced here rather than by hiding the numbers.
+          // Age is computed at render time so it keeps counting up while the
+          // data is frozen. "stale" on its own once concealed a six-hour gap.
+          const ageMs = updatedAt() ? Date.now() - updatedAt() : 0;
+          const badlyStale = ageMs > STALE_ALERT_MS;
+
+          // Problems are reported next to the numbers, never instead of them.
+          const warnLine =
+            warn() || badlyStale
+              ? jsx("text", {
+                  fg: badlyStale ? (theme.warning ?? theme.textMuted) : theme.textMuted,
+                  children: ` ${warn() || "not refreshing"} \u00B7 ${fmtAge(ageMs)} old`,
+                })
+              : null;
+
           const footer = updated()
             ? jsx("text", {
                 fg: theme.textMuted,
-                children: ` updated ${updated()}${stale() ? " \u00B7 stale" : ""}`,
+                children: ` updated ${updated()}${stale() && !warnLine ? " \u00B7 stale" : ""}`,
               })
             : null;
 
@@ -686,6 +773,7 @@ const tui = async (api: any) => {
             children: [
               header,
               ...(Array.isArray(body) ? body : [body]),
+              warnLine,
               footer,
             ],
           });
@@ -716,4 +804,10 @@ export const __internals = {
   INTERVAL_FLOOR_MS,
   INTERVAL_CEIL_MS,
   OK_STREAK_TO_SPEED_UP,
+  MAX_COOLDOWN_MS,
+  AUTH_RECHECK_MS,
+  AUTH_SKEW_MS,
+  MAX_UNREADABLE_STREAK,
+  readAuth,
+  fmtAge,
 };

@@ -5,7 +5,7 @@ Show your **real** Claude subscription usage - the exact panel from
 weekly limits) - live in the **OpenCode TUI sidebar**.
 
 ```
-▼ ⚡ Claude usage 0.2.1
+▼ ⚡ Claude usage 0.2.2
  Session (5h) ·        10%
  ██░░░░░░░░░░░░░░░░  resets in 3m
  Weekly all             8%
@@ -76,8 +76,10 @@ Then reference the built file in `tui.json` with an **absolute** `file://` URL:
 - Bars are color-coded: green under 70%, yellow 70-90%, red 90%+. When the
   endpoint reports a `severity` for a row, that wins over the local thresholds.
 - A `·` after a row label marks the limit the server flags as currently active.
-- The footer shows the last successful fetch time, plus `· stale` when the most
-  recent refresh attempt failed.
+- The footer shows the last successful fetch time. If a refresh is failing, an
+  extra line states the reason and **how old the numbers actually are**
+  (`token expired - reopen OpenCode · 5h 51m old`), highlighted in the warning
+  colour once the data passes 15 minutes.
 
 ## Rate limiting and the adaptive interval
 
@@ -100,26 +102,78 @@ It converges on the fastest cadence that does *not* get rate-limited, and
 self-heals if Anthropic retunes the limit. The current interval is **persisted
 in the shared cache**, so every instance agrees on it and it survives restarts.
 
-`Retry-After` is honoured only when it is **greater than 0**. The endpoint
-currently sends `Retry-After: 0`, which taken literally would mean "retry
-immediately" and re-trigger the limit.
+### `Retry-After` is clamped at both ends
 
-## Transient errors no longer blank the panel
+The server's own retry hint is not trusted unconditionally, because it has been
+observed to be useless in both directions:
 
-Previously any error - including a routine 429 - replaced the usage bars with
-an error message. That was the main user-visible bug, and it made the panel
-useless roughly a third of the time.
+- **`0` is ignored.** The endpoint routinely sends `Retry-After: 0`, which taken
+  literally means "retry immediately" and simply re-triggers the limit. Only a
+  value **greater than 0** is honoured.
+- **Large values are capped at 10 minutes** (`MAX_COOLDOWN_MS`). A
+  `Retry-After: 3600` has been seen in the wild; obeying it verbatim parked the
+  panel for a full hour, long after the underlying problem had cleared. A quota
+  panel is worth re-checking far sooner than the server's worst-case hint
+  suggests.
 
-Now errors are split in two:
+That 10-minute ceiling is also applied as a final clamp over **every** failure
+branch, not just the 429 path - so no combination of errors, backoff ladders and
+server hints can freeze the panel for longer than that.
 
-- **Transient** (429, 5xx, network blip) - the last-known numbers **stay on
-  screen** and the footer is marked `stale`. Quota moves by fractions of a
-  percent per minute, so slightly stale numbers beat no numbers.
-- **Terminal** (`no-token`, `auth expired`) - no amount of retrying helps until
-  you act, so these *do* replace the panel body.
+## Expired tokens cost no requests
+
+`auth.json` carries an `expires` timestamp, so a dead token can be spotted
+locally **for free**. Before it will even try to take the fetch lock, the plugin
+checks that stamp (with 60s of slack) and, if the token has lapsed, **skips the
+network call entirely** and re-checks in 30s.
+
+This matters more than it sounds. Firing a request with a known-dead token is
+worse than useless: it cannot succeed, and it still spends one of the very few
+requests the endpoint allows. That is exactly how a **single overnight token
+lapse escalated into an hour-long lockout**: the machine slept, no inference
+happened so OpenCode never refreshed the token, the plugin kept retrying with
+the dead credential, burned the rate-limit budget on doomed requests, and was
+answered with `Retry-After: 3600` - which the old code obeyed literally. Net
+effect: ~6 hours of frozen numbers.
+
+Because the pre-flight is a local file read, recovery is automatic and
+immediate: the moment OpenCode rewrites `auth.json` (which it does on any
+inference call), the next tick picks it up. A missing token (`no-token`) is
+treated the same way.
+
+## Errors never blank a populated panel
+
+Originally any error - including a routine 429 - replaced the usage bars with an
+error message. 0.2.0 fixed that for *transient* errors but still let a
+**terminal** one (`no-token`, `auth expired`) wipe the body, which meant a
+lapsed token hid perfectly good cached figures behind "token expired".
+
+The rule is now simply: **if there are numbers, the numbers stay.**
+
+- **Rows present** - they remain on screen and the problem is reported on an
+  extra line *beneath* them. Quota moves by fractions of a percent per minute,
+  so slightly stale numbers beat no numbers, whatever the error class.
+- **No rows at all** - there is nothing to protect, so the message replaces the
+  body.
+
+To stop that leniency from hiding a real outage, the extra line reports the
+**actual age** of the data rather than a bare `stale` marker - which on the
+incident above quietly concealed a six-hour gap:
+
+```
+ Session (5h) ·        10%
+ ██░░░░░░░░░░░░░░░░  resets in 3m
+ token expired - reopen OpenCode · 5h 51m old
+ updated 20:31:42
+```
+
+The age is recomputed on every tick, so it keeps counting up while the data is
+frozen instead of freezing along with it, and it switches to the warning colour
+past 15 minutes (`STALE_ALERT_MS`).
 
 Non-429 failures (network drops, 5xx) additionally back off on a capped
-exponential ladder, up to 15 minutes.
+exponential ladder, up to 15 minutes - subject to the same 10-minute cooldown
+ceiling described above.
 
 ## Configuration
 
@@ -191,6 +245,15 @@ Coordination is hardened as of 0.2.0:
   "no cache". Previously a torn read looked identical to a first run and
   triggered a fetch, burning the single request the whole account gets per
   interval.
+- **A UTF-8 BOM is stripped before parsing** (0.2.2). `JSON.parse` rejects a
+  leading BOM, and anything that hand-edits the cache on Windows adds one -
+  PowerShell 5.1's `Set-Content -Encoding utf8` most notably. One such edit was
+  enough to make the file unparseable and wedge *every* instance at once.
+- **Five consecutive unreadable reads triggers a rewrite** (0.2.2,
+  `MAX_UNREADABLE_STREAK`). Skipping the tick is the right response to a file
+  that is merely mid-write, but it is the wrong response forever. After five
+  failures the cache is treated as missing so the next write repairs it, rather
+  than the panel waiting indefinitely for a file that will never parse.
 
 Set `CLAUDE_QUOTA_CACHE_FILE` to override the cache location (e.g. to isolate
 profiles).
@@ -211,10 +274,14 @@ locations.
 - **"no Anthropic login in OpenCode"** - log in to Claude in OpenCode first
   (`/connect` or the Anthropic OAuth flow).
 - **"token expired - reopen OpenCode"** - the OAuth token lapsed; reopening
-  OpenCode refreshes it.
-- **Footer says `stale`** - the last refresh hit a 429, a 5xx or a network
-  error. The numbers shown are the last good ones and the interval has already
-  backed off; it recovers on its own. Nothing to do.
+  OpenCode, or just making any inference call, refreshes it. While it is lapsed
+  the plugin makes **no requests at all**, so nothing is being wasted, and it
+  picks the new token up within 30s. Any cached numbers stay visible.
+- **A line like `... · 5h 51m old`** - the last refresh failed and the age tells
+  you how far behind the numbers are. Transient causes (429, 5xx, network) clear
+  on their own, since the interval has already backed off and no cooldown can
+  exceed 10 minutes. An age of hours alongside `token expired` means the
+  credential needs refreshing, not the plugin.
 - **Panel doesn't appear** - confirm the entry is in `tui.json` (not
   `opencode.json`), the sidebar is visible, and (from source) the `file://`
   path is absolute and points at the built `dist/index.js`.
