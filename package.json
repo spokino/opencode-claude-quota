@@ -1,7 +1,7 @@
 {
   "name": "opencode-claude-quota",
-  "version": "0.2.2",
-  "description": "Show your real Claude subscription usage (5-hour session + weekly limits) in the OpenCode TUI sidebar",
+  "version": "1.0.0",
+  "description": "Show your real Claude subscription usage (5-hour session + weekly limits) in the OpenCode v2 TUI sidebar",
   "keywords": [
     "opencode",
     "opencode-plugin",
@@ -24,13 +24,13 @@
     "url": "https://github.com/spokino/opencode-claude-quota/issues"
   },
   "type": "module",
-  "main": "./dist/index.js",
+  "main": "./dist/server.js",
   "exports": {
     ".": {
-      "import": "./dist/index.js"
+      "import": "./dist/server.js"
     },
     "./tui": {
-      "import": "./dist/index.js"
+      "import": "./dist/tui.js"
     }
   },
   "files": [
@@ -39,7 +39,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "bun build ./src/index.tsx --target=node --external @opentui/solid --external solid-js --outfile ./dist/index.js",
+    "build": "bun build ./src/server.ts --target=node --outfile ./dist/server.js && bun build ./src/tui.tsx --target=node --external @opentui/solid --external solid-js --outfile ./dist/tui.js",
     "prepublishOnly": "bun run build"
   },
   "peerDependencies": {

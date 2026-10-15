@@ -5,7 +5,7 @@ Show your **real** Claude subscription usage - the exact panel from
 weekly limits) - live in the **OpenCode TUI sidebar**.
 
 ```
-▼ ⚡ Claude usage 0.2.2
+▼ ⚡ Claude usage 1.0.0
  Session (5h) ·        10%
  ██░░░░░░░░░░░░░░░░  resets in 3m
  Weekly all             8%
@@ -21,29 +21,44 @@ Claude Code's own statusline show.
 
 ## How it works
 
-It calls the Anthropic OAuth usage endpoint using the OAuth token OpenCode
-already stores when you log in to Claude:
+It calls the Anthropic OAuth usage endpoint with the OAuth token OpenCode
+already holds for your Claude login:
 
 ```
 GET https://api.anthropic.com/api/oauth/usage
-Authorization: Bearer <token from OpenCode auth.json>
+Authorization: Bearer <OpenCode Anthropic OAuth token>
 anthropic-beta: oauth-2025-04-20
 ```
 
 No browser cookie, no API key, no config. If you're logged into Claude in
 OpenCode, it just works.
 
+Since 1.0.0 the plugin targets **OpenCode v2** and has two halves:
+
+| Half | Entry | Job |
+| --- | --- | --- |
+| server | `.` (`dist/server.js`) | Resolves the token from OpenCode's **Anthropic integration** (`ctx.integration.connection`), fetches usage, serves it over plugin RPC (`claude-quota.snapshot`) |
+| TUI | `./tui` (`dist/tui.js`) | Renders the sidebar panel from the RPC. Works against a remote OpenCode server too |
+
+If the server half is not loaded (plugin configured only in `cli.json`), the
+TUI falls back to fetching locally with the token from `auth.json`.
+
+It is deliberately **not** an OpenCode integration: integrations define how a
+service is *connected* (API key / OAuth / CLI login). This plugin only
+*consumes* the existing Anthropic connection.
+
+> OpenCode v1 is not supported by 1.x. Use `opencode-claude-quota@0.2` there.
+
 ## Install
 
 ### npm (recommended)
 
-Add to your **`tui.json`** (not `opencode.json` - sidebar plugins live in the
-TUI config):
+Add to **`opencode.json`**. OpenCode v2 loads the server half there and the
+CLI picks up the `./tui` panel automatically:
 
 ```json
 {
-  "$schema": "https://opencode.ai/tui.json",
-  "plugin": ["opencode-claude-quota"]
+  "plugins": ["opencode-claude-quota"]
 }
 ```
 
@@ -57,16 +72,19 @@ cd opencode-claude-quota
 bun install && bun run build
 ```
 
-Then reference the built file in `tui.json` with an **absolute** `file://` URL:
+Then reference the **directory** with an absolute `file://` URL:
 
 ```json
 {
-  "plugin": ["file:///absolute/path/to/opencode-claude-quota/dist/index.js"]
+  "plugins": ["file:///absolute/path/to/opencode-claude-quota"]
 }
 ```
 
-> A **relative** `file://./...` reference is silently ignored by OpenCode - use
-> an absolute path.
+> A local plugin directory is loaded through its root `index.js` (server) and
+> `tui.js` (panel), which re-export `dist/`. OpenCode v2 ignores `package.json`
+> `exports` for local directories and silently skips a directory without them;
+> pointing at a single `.js` file is rejected ("configured plugin path must be
+> a directory").
 
 ## Usage
 
@@ -258,8 +276,9 @@ Coordination is hardened as of 0.2.0:
 Set `CLAUDE_QUOTA_CACHE_FILE` to override the cache location (e.g. to isolate
 profiles).
 
-`auth.json` is auto-detected across Windows / macOS / Linux OpenCode install
-locations.
+With the server half loaded the token comes from OpenCode's Anthropic
+integration. For the TUI-only fallback, `auth.json` is auto-detected across
+Windows / macOS / Linux OpenCode install locations.
 
 ## What the rows mean
 
@@ -282,9 +301,13 @@ locations.
   on their own, since the interval has already backed off and no cooldown can
   exceed 10 minutes. An age of hours alongside `token expired` means the
   credential needs refreshing, not the plugin.
-- **Panel doesn't appear** - confirm the entry is in `tui.json` (not
-  `opencode.json`), the sidebar is visible, and (from source) the `file://`
-  path is absolute and points at the built `dist/index.js`.
+- **Panel doesn't appear** - confirm the entry is under `plugins` in
+  `opencode.json`, `opencode plugin list` shows `claude-quota`, the sidebar is
+  visible, and (from source) the `file://` path is absolute, points at the
+  repository directory, and `bun run build` has produced `dist/`.
+- **Check the server half directly** -
+  `opencode api POST /api/rpc/claude-quota/snapshot -d '{"input":{}}'` returns
+  the same rows the panel renders (Git Bash: prefix `MSYS_NO_PATHCONV=1`).
 
 ## Disclaimer
 

@@ -1,36 +1,6 @@
-// opencode-claude-quota
-// Renders the real Claude subscription usage panel (the one at
-// https://claude.ai/settings/usage) in the OpenCode TUI sidebar.
-//
-// Data source: GET https://api.anthropic.com/api/oauth/usage
-//   Authorization: Bearer <OpenCode Anthropic OAuth access token>
-//   anthropic-beta: oauth-2025-04-20
-// This is the same endpoint claude.ai and Claude Code's statusline use.
-// The OAuth token is read from OpenCode's own auth.json (no browser cookie).
-//
-// See README for the ToS note: this reads YOUR own quota with YOUR own token,
-// read-only, and stores nothing. Use at your own risk.
-//
-// ---------------------------------------------------------------------------
-// Rate limiting (measured 2026-09-09)
-// ---------------------------------------------------------------------------
-// The 429 bucket is PER CREDENTIAL and allows roughly ONE request per ~90s.
-// Evidence: at a fixed 90s cadence the plugin 429'd on 2 of 7 consecutive
-// polls (~29%). A second consumer using the same OAuth token 429'd on 4 of 4
-// probes spaced 100s apart, while the plugin kept succeeding - i.e. the two
-// contend for one shared budget. A browser session cookie has its own,
-// separate bucket.
-//
-// Two consequences drive the design below:
-//   1. A fixed 90s poll sits exactly ON the limit, so it fails intermittently.
-//      -> The interval is now self-tuning (AIMD), converging on the fastest
-//         rate that does NOT 429.
-//   2. Quota percentages move by fractions of a percent per minute, so hiding
-//      cached numbers behind a transient "rate limited" message is strictly
-//      worse than showing slightly stale data.
-//      -> Transient errors NEVER replace the panel body.
-import { createRoot, createSignal, onCleanup } from "solid-js";
-import { jsx, jsxs } from "@opentui/solid/jsx-runtime";
+// Usage fetching, shared cross-instance cache and adaptive polling.
+// Used by the server half (token from OpenCode's Anthropic integration) and by
+// the TUI half as a fallback when the server half is not loaded.
 import {
   appendFileSync,
   readFileSync,
@@ -42,7 +12,7 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
-const VERSION = "0.2.2";
+const VERSION = "1.0.0";
 
 const USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
 
@@ -132,9 +102,13 @@ const AUTH_PATHS = [
   join(homedir(), "Library", "Application Support", "opencode", "auth.json"),
 ].filter(Boolean) as string[];
 
-type Auth = { token: string; expires?: number };
+export type Auth = { token: string; expires?: number };
 
-function readAuth(): Auth | undefined {
+// Where the OAuth token comes from. The server half resolves it from OpenCode's
+// Anthropic integration; the TUI-only fallback reads auth.json.
+export type AuthSource = () => Auth | undefined | Promise<Auth | undefined>;
+
+export function readAuth(): Auth | undefined {
   for (const p of AUTH_PATHS) {
     try {
       const j = JSON.parse(readFileSync(p, "utf8"));
@@ -245,10 +219,7 @@ class UsageError extends Error {
 }
 
 // Raw fetch of the live endpoint.
-async function fetchUsageRaw(): Promise<Row[]> {
-  const auth = readAuth();
-  if (!auth) throw new UsageError("no-token", "terminal");
-
+async function fetchUsageRaw(auth: Auth): Promise<Row[]> {
   const res = await fetch(USAGE_URL, {
     headers: {
       Authorization: `Bearer ${auth.token}`,
@@ -429,7 +400,7 @@ let unreadableStreak = 0;
 
 // Returns the freshest data for rendering, fetching only when needed and only
 // from one instance at a time.
-async function getUsage(): Promise<Result> {
+export async function getUsage(authSource: AuthSource = readAuth): Promise<Result> {
   const now = Date.now();
   const read = readCache();
 
@@ -463,7 +434,12 @@ async function getUsage(): Promise<Result> {
   // than useless: it cannot succeed, and it spends one of the very few
   // requests the endpoint allows. That is exactly how an overnight token
   // lapse escalated into an hour-long 429 lockout.
-  const auth = readAuth();
+  let auth: Auth | undefined;
+  try {
+    auth = await authSource();
+  } catch (e: any) {
+    log(`auth source failed: ${e?.message ?? e}`);
+  }
   if (!auth) {
     writeCache({ ...cache, error: "no-token", errorKind: "terminal", cooldownUntil: now + AUTH_RECHECK_MS });
     return { rows: cache.rows ?? [], error: "no-token", errorKind: "terminal", fetchedAt: cache.fetchedAt, stale: true };
@@ -484,7 +460,7 @@ async function getUsage(): Promise<Result> {
   // 4. We hold the lock. Fetch.
   const started = Date.now();
   try {
-    const rows = await fetchUsageRaw();
+    const rows = await fetchUsageRaw(auth);
     const fetchedAt = Date.now();
     const ms = fetchedAt - started;
 
@@ -576,217 +552,20 @@ async function getUsage(): Promise<Result> {
   }
 }
 
-let initialized = false;
-
-const tui = async (api: any) => {
-  if (initialized) return;
-  initialized = true;
-
-  log(
-    `start v${VERSION}; cache=${CACHE_FILE}; ` +
-      `mode=${FIXED_POLL_MS ? `fixed ${FIXED_POLL_MS}ms` : "adaptive"}`,
-  );
-
-  createRoot(() => {
-    const [rows, setRows] = createSignal<Row[]>([]);
-    // notice = there is nothing to show at all, so this replaces the body.
-    const [notice, setNotice] = createSignal<string>("");
-    // warn = we DO have numbers, but something is wrong with them. Rendered as
-    // an extra line under the rows so the data stays visible and explained.
-    const [warn, setWarn] = createSignal<string>("");
-    const [stale, setStale] = createSignal<boolean>(false);
-    const [updated, setUpdated] = createSignal<string>("");
-    // Kept as a raw timestamp so the rendered age recomputes on every tick
-    // rather than freezing at whatever it was when the fetch failed.
-    const [updatedAt, setUpdatedAt] = createSignal<number>(0);
-
-    const EXPANDED_KV = "claude-quota.expanded";
-    const [expanded, setExpanded] = createSignal(
-      api.kv?.get?.(EXPANDED_KV, true) !== false,
-    );
-
-    function prettyErr(m: string): string {
-      if (m === "no-token") return "no Anthropic login in OpenCode";
-      if (m === "auth expired") return "token expired - reopen OpenCode";
-      return m || "fetch failed";
-    }
-
-    async function refresh() {
-      const res = await getUsage();
-      // Cache was mid-write. Leave the display exactly as it is.
-      if (res.skip) return;
-
-      if (res.rows.length) setRows(res.rows);
-
-      // No error must ever blank a panel that has numbers in it. If we have
-      // rows, they stay on screen and the problem is reported alongside them;
-      // only a completely empty panel gets replaced by the message. An earlier
-      // version replaced the body on any terminal error, which hid perfectly
-      // good figures behind "token expired".
-      const nothingToShow = res.rows.length === 0;
-      setNotice(res.error && nothingToShow ? prettyErr(res.error) : "");
-      setWarn(res.error && !nothingToShow ? prettyErr(res.error) : "");
-      setStale(res.stale && res.rows.length > 0);
-
-      if (res.fetchedAt) {
-        setUpdated(new Date(res.fetchedAt).toLocaleTimeString());
-        setUpdatedAt(res.fetchedAt);
-      }
-    }
-
-    refresh();
-    const timer = setInterval(refresh, TICK_MS);
-    onCleanup(() => clearInterval(timer));
-
-    const TOGGLE = "claude-quota.toggle";
-    api.keymap?.registerLayer?.({
-      commands: [
-        {
-          name: TOGGLE,
-          title: "Claude Quota: Toggle panel",
-          description: "Collapse or expand the Claude usage panel",
-          run: () => {
-            const next = !expanded();
-            setExpanded(next);
-            api.kv?.set?.(EXPANDED_KV, next);
-          },
-        },
-      ],
-      bindings: [{ key: "alt+q", cmd: TOGGLE }],
-    });
-
-    api.slots?.register?.({
-      order: 150,
-      slots: {
-        sidebar_content(ctx: any) {
-          const theme = ctx.theme.current;
-
-          function colorFor(r: Row) {
-            // Prefer the server's own severity when the endpoint provides it.
-            switch (r.severity) {
-              case "critical":
-              case "error":
-                return theme.error ?? theme.text;
-              case "warning":
-              case "warn":
-                return theme.warning ?? theme.text;
-              case "normal":
-                return theme.success ?? theme.text;
-            }
-            return r.percent >= 90
-              ? (theme.error ?? theme.text)
-              : r.percent >= 70
-                ? (theme.warning ?? theme.text)
-                : (theme.success ?? theme.text);
-          }
-
-          const header = jsxs("box", {
-            flexDirection: "row",
-            justifyContent: "space-between",
-            onMouseDown: () => {
-              const next = !expanded();
-              setExpanded(next);
-              api.kv?.set?.(EXPANDED_KV, next);
-            },
-            children: [
-              jsxs("text", {
-                fg: theme.text,
-                children: [
-                  expanded() ? "\u25BC" : "\u25B6",
-                  " \u26A1 Claude usage",
-                ],
-              }),
-              jsx("text", { fg: theme.textMuted, children: ` ${VERSION}` }),
-            ],
-          });
-
-          if (!expanded())
-            return jsx("box", { flexDirection: "column", children: [header] });
-
-          // Filtering happens at render time, not at fetch time: the shared
-          // cache stays canonical so instances with different settings agree.
-          const visible = rows().filter((r) => !isHidden(r));
-
-          let body: any;
-          if (notice()) {
-            body = jsx("text", { fg: theme.textMuted, children: ` ${notice()}` });
-          } else if (rows().length === 0) {
-            body = jsx("text", { fg: theme.textMuted, children: " loading..." });
-          } else if (visible.length === 0) {
-            body = jsx("text", { fg: theme.textMuted, children: " all rows hidden" });
-          } else {
-            body = visible.map((r) => {
-              const color = colorFor(r);
-              return jsxs("box", {
-                flexDirection: "column",
-                children: [
-                  jsxs("box", {
-                    flexDirection: "row",
-                    justifyContent: "space-between",
-                    children: [
-                      jsx("text", {
-                        fg: theme.text,
-                        children: ` ${r.label}${r.active ? " \u00B7" : ""}`,
-                      }),
-                      jsx("text", {
-                        fg: color,
-                        children: `${Math.round(r.percent)}%`,
-                      }),
-                    ],
-                  }),
-                  jsxs("box", {
-                    flexDirection: "row",
-                    justifyContent: "space-between",
-                    children: [
-                      jsx("text", { fg: color, children: ` ${bar(r.percent)}` }),
-                      jsx("text", { fg: theme.textMuted, children: r.reset }),
-                    ],
-                  }),
-                ],
-              });
-            });
-          }
-
-          // Age is computed at render time so it keeps counting up while the
-          // data is frozen. "stale" on its own once concealed a six-hour gap.
-          const ageMs = updatedAt() ? Date.now() - updatedAt() : 0;
-          const badlyStale = ageMs > STALE_ALERT_MS;
-
-          // Problems are reported next to the numbers, never instead of them.
-          const warnLine =
-            warn() || badlyStale
-              ? jsx("text", {
-                  fg: badlyStale ? (theme.warning ?? theme.textMuted) : theme.textMuted,
-                  children: ` ${warn() || "not refreshing"} \u00B7 ${fmtAge(ageMs)} old`,
-                })
-              : null;
-
-          const footer = updated()
-            ? jsx("text", {
-                fg: theme.textMuted,
-                children: ` updated ${updated()}${stale() && !warnLine ? " \u00B7 stale" : ""}`,
-              })
-            : null;
-
-          return jsxs("box", {
-            flexDirection: "column",
-            children: [
-              header,
-              ...(Array.isArray(body) ? body : [body]),
-              warnLine,
-              footer,
-            ],
-          });
-        },
-      },
-    });
-  });
+export type { Row, Result, ErrorKind };
+export {
+  VERSION,
+  TICK_MS,
+  STALE_ALERT_MS,
+  FIXED_POLL_MS,
+  CACHE_FILE,
+  log,
+  bar,
+  fmtAge,
+  isHidden,
 };
 
-export default { id: "claude-quota", tui };
-
-// Internals exposed for the test harness only. OpenCode loads the default
-// export; this named export is inert at runtime.
+// Internals exposed for the test harness only.
 export const __internals = {
   getUsage,
   readCache,
