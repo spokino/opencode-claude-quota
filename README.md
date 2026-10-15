@@ -47,7 +47,7 @@ It is deliberately **not** an OpenCode integration: integrations define how a
 service is *connected* (API key / OAuth / CLI login). This plugin only
 *consumes* the existing Anthropic connection.
 
-> OpenCode v1 is not supported by 1.x. Use `opencode-claude-quota@0.2` there.
+> OpenCode v1 is not supported by 1.x. For v1, build from commit `a651468` (0.2.2).
 
 ## Install
 
