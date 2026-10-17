@@ -2,7 +2,7 @@
 // integration (no auth.json scraping) and serves usage over plugin RPC, so the
 // TUI also works against a remote OpenCode server.
 import { QuotaRpc } from "./rpc.js";
-import { getUsage, readAuth, log, type Auth } from "./usage.js";
+import { getUsage, readAuth, pickAuth, log, type Auth } from "./usage.js";
 
 const PROVIDER = "anthropic";
 
@@ -10,15 +10,22 @@ export default {
   id: "claude-quota",
   async setup(ctx: any) {
     async function integrationAuth(): Promise<Auth | undefined> {
-      const connection = await ctx.integration.connection.active(PROVIDER);
-      const credential = connection
-        ? await ctx.integration.connection.resolve(connection)
-        : undefined;
-      if (credential?.type === "oauth" && typeof credential.access === "string") {
-        return { token: credential.access, expires: credential.expires };
+      let primary: Auth | undefined;
+      try {
+        const connection = await ctx.integration.connection.active(PROVIDER);
+        const credential = connection
+          ? await ctx.integration.connection.resolve(connection)
+          : undefined;
+        if (credential?.type === "oauth" && typeof credential.access === "string") {
+          primary = { token: credential.access, expires: credential.expires };
+        }
+      } catch (e: any) {
+        log(`integration auth failed: ${e?.message ?? e}`);
       }
-      // API-key logins have no subscription quota; legacy auth.json may still.
-      return readAuth();
+      // The integration credential is only refreshed when OpenCode itself calls
+      // Anthropic, so it can sit expired for hours. Fall back to auth.json and
+      // Claude Code's credentials, whichever is still live.
+      return pickAuth(primary, readAuth());
     }
 
     await ctx.rpc.register(QuotaRpc, {

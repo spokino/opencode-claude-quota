@@ -42,6 +42,7 @@ import {
   log,
   bar,
   fmtAge,
+  fmtReset,
   isHidden,
   getUsage,
   type Result,
@@ -83,7 +84,7 @@ const setup = (api: any) => {
 
   function prettyErr(m: string): string {
     if (m === "no-token") return "no Anthropic login in OpenCode";
-    if (m === "auth expired") return "token expired - reopen OpenCode";
+    if (m === "auth expired") return "token expired - use OpenCode or run claude to refresh";
     return m || "fetch failed";
   }
 
@@ -241,7 +242,7 @@ const setup = (api: any) => {
                   justifyContent: "space-between",
                   children: [
                     jsx("text", { fg: color, children: ` ${bar(r.percent)}` }),
-                    jsx("text", { fg: theme.textMuted, children: r.reset }),
+                    jsx("text", { fg: theme.textMuted, children: r.resetsAt ? fmtReset(r.resetsAt) : r.reset }),
                   ],
                 }),
               ],

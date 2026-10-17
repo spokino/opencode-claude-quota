@@ -108,10 +108,10 @@ export type Auth = { token: string; expires?: number };
 // Anthropic integration; the TUI-only fallback reads auth.json.
 export type AuthSource = () => Auth | undefined | Promise<Auth | undefined>;
 
-export function readAuth(): Auth | undefined {
+function readOpenCodeAuth(): Auth | undefined {
   for (const p of AUTH_PATHS) {
     try {
-      const j = JSON.parse(readFileSync(p, "utf8"));
+      const j = JSON.parse(readFileSync(p, "utf8").replace(/^\uFEFF/, ""));
       const a = j?.anthropic;
       if (a?.access) return { token: a.access as string, expires: a.expires };
     } catch {
@@ -119,6 +119,42 @@ export function readAuth(): Auth | undefined {
     }
   }
   return undefined;
+}
+
+// Claude Code keeps its own OAuth token for the same account and refreshes it
+// whenever the CLI runs. Read-only: we never refresh or write it back, so we
+// cannot desync either client's refresh token.
+function readClaudeCodeAuth(): Auth | undefined {
+  const dir = process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
+  try {
+    const j = JSON.parse(
+      readFileSync(join(dir, ".credentials.json"), "utf8").replace(/^\uFEFF/, ""),
+    );
+    const a = j?.claudeAiOauth;
+    if (typeof a?.accessToken === "string") {
+      return { token: a.accessToken, expires: Number(a.expiresAt) || undefined };
+    }
+  } catch {
+    /* not installed / not logged in */
+  }
+  return undefined;
+}
+
+function isLive(a: Auth, now = Date.now()): boolean {
+  return !a.expires || a.expires - AUTH_SKEW_MS >= now;
+}
+
+// First live token in priority order; if none is live, the one expiring last
+// (so the expiry pre-flight still reports it).
+export function pickAuth(...candidates: (Auth | undefined)[]): Auth | undefined {
+  const all = candidates.filter((a): a is Auth => !!a);
+  const live = all.find((a) => isLive(a));
+  if (live) return live;
+  return all.sort((x, y) => (y.expires ?? 0) - (x.expires ?? 0))[0];
+}
+
+export function readAuth(): Auth | undefined {
+  return pickAuth(readOpenCodeAuth(), readClaudeCodeAuth());
 }
 
 // --- Debug log --------------------------------------------------------------
@@ -182,7 +218,8 @@ function bar(percent: number): string {
 type Row = {
   label: string;
   percent: number;
-  reset: string;
+  reset: string; // formatted at fetch time; fallback only
+  resetsAt?: string; // raw ISO, re-formatted on every render
   severity?: string;
   active?: boolean;
 };
@@ -251,6 +288,7 @@ async function fetchUsageRaw(auth: Auth): Promise<Row[]> {
         label: labelFor(l.kind, l.scope),
         percent: Number(l.percent) || 0,
         reset: fmtReset(l.resets_at),
+        resetsAt: l.resets_at ?? undefined,
         // Optional server-driven fields. Absent on older responses, in which
         // case rendering falls back to local percentage thresholds.
         severity: typeof l.severity === "string" ? l.severity : undefined,
@@ -263,12 +301,14 @@ async function fetchUsageRaw(auth: Auth): Promise<Row[]> {
         label: "Session (5h)",
         percent: Number(data.five_hour.utilization) || 0,
         reset: fmtReset(data.five_hour.resets_at),
+        resetsAt: data.five_hour.resets_at ?? undefined,
       });
     if (data?.seven_day)
       rows.push({
         label: "Weekly all",
         percent: Number(data.seven_day.utilization) || 0,
         reset: fmtReset(data.seven_day.resets_at),
+        resetsAt: data.seven_day.resets_at ?? undefined,
       });
   }
   return rows;
@@ -562,6 +602,7 @@ export {
   log,
   bar,
   fmtAge,
+  fmtReset,
   isHidden,
 };
 
