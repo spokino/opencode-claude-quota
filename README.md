@@ -41,7 +41,9 @@ Since 1.0.0 the plugin targets **OpenCode v2** and has two halves:
 | TUI | `./tui` (`dist/tui.js`) | Renders the sidebar panel from the RPC. Works against a remote OpenCode server too |
 
 If the server half is not loaded (plugin configured only in `cli.json`), the
-TUI falls back to fetching locally with the token from `auth.json`.
+TUI falls back to fetching locally with Claude Code's token
+(`~/.claude/.credentials.json`, kept fresh by `opencode-claude-auth`), then
+OpenCode's legacy `auth.json` as a last resort.
 
 It is deliberately **not** an OpenCode integration: integrations define how a
 service is *connected* (API key / OAuth / CLI login). This plugin only
@@ -96,7 +98,7 @@ Then reference the **directory** with an absolute `file://` URL:
 - A `·` after a row label marks the limit the server flags as currently active.
 - The footer shows the last successful fetch time. If a refresh is failing, an
   extra line states the reason and **how old the numbers actually are**
-  (`token expired - reopen OpenCode · 5h 51m old`), highlighted in the warning
+  (`token expired - send a Claude prompt to refresh · 5h 51m old`), highlighted in the warning
   colour once the data passes 15 minutes.
 
 ## Rate limiting and the adaptive interval
@@ -181,7 +183,7 @@ incident above quietly concealed a six-hour gap:
 ```
  Session (5h) ·        10%
  ██░░░░░░░░░░░░░░░░  resets in 3m
- token expired - reopen OpenCode · 5h 51m old
+ token expired - send a Claude prompt to refresh · 5h 51m old
  updated 20:31:42
 ```
 
@@ -292,8 +294,8 @@ Windows / macOS / Linux OpenCode install locations.
 
 - **"no Anthropic login in OpenCode"** - log in to Claude in OpenCode first
   (`/connect` or the Anthropic OAuth flow).
-- **"token expired - reopen OpenCode"** - the OAuth token lapsed; reopening
-  OpenCode, or just making any inference call, refreshes it. While it is lapsed
+- **"token expired - send a Claude prompt to refresh"** - the OAuth token lapsed; sending any
+  Claude prompt in OpenCode refreshes it. While it is lapsed
   the plugin makes **no requests at all**, so nothing is being wasted, and it
   picks the new token up within 30s. Any cached numbers stay visible.
 - **A line like `... · 5h 51m old`** - the last refresh failed and the age tells

@@ -2,14 +2,14 @@
 // integration (no auth.json scraping) and serves usage over plugin RPC, so the
 // TUI also works against a remote OpenCode server.
 import { QuotaRpc } from "./rpc.js";
-import { getUsage, readAuth, pickAuth, log, type Auth } from "./usage.js";
+import { getUsage, readAuthCandidates, rankAuth, log, type Auth } from "./usage.js";
 
 const PROVIDER = "anthropic";
 
 export default {
   id: "claude-quota",
   async setup(ctx: any) {
-    async function integrationAuth(): Promise<Auth | undefined> {
+    async function integrationAuth(): Promise<Auth[]> {
       let primary: Auth | undefined;
       try {
         const connection = await ctx.integration.connection.active(PROVIDER);
@@ -23,9 +23,10 @@ export default {
         log(`integration auth failed: ${e?.message ?? e}`);
       }
       // The integration credential is only refreshed when OpenCode itself calls
-      // Anthropic, so it can sit expired for hours. Fall back to auth.json and
-      // Claude Code's credentials, whichever is still live.
-      return pickAuth(primary, readAuth());
+      // Anthropic, so it can sit expired for hours. Fall back to Claude Code's
+      // credentials (kept fresh by opencode-claude-auth), then the legacy
+      // auth.json. The ranked list lets getUsage skip a revoked token on 401.
+      return rankAuth(primary, ...readAuthCandidates());
     }
 
     await ctx.rpc.register(QuotaRpc, {

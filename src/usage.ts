@@ -12,7 +12,7 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
-const VERSION = "1.0.0";
+const VERSION = "1.0.1";
 
 const USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
 
@@ -70,9 +70,9 @@ const MAX_BACKOFF_MS = 15 * 60_000;
 // honouring that verbatim froze the panel for an hour. A quota panel is worth
 // re-checking far sooner than the server's worst-case hint suggests.
 const MAX_COOLDOWN_MS = 10 * 60_000;
-// How long to wait before re-reading auth.json after finding an expired token.
-// This costs no network call, so it can be short - the moment OpenCode
-// refreshes the token the panel recovers.
+// How long to wait before re-reading credentials after finding an expired
+// token. This costs no network call, so it can be short - the moment the token
+// is refreshed the panel recovers.
 const AUTH_RECHECK_MS = 30_000;
 // Treat the token as dead slightly before its stated expiry, to avoid firing a
 // request that will land after it lapses.
@@ -105,8 +105,11 @@ const AUTH_PATHS = [
 export type Auth = { token: string; expires?: number };
 
 // Where the OAuth token comes from. The server half resolves it from OpenCode's
-// Anthropic integration; the TUI-only fallback reads auth.json.
-export type AuthSource = () => Auth | undefined | Promise<Auth | undefined>;
+// Anthropic integration; the TUI-only fallback reads Claude Code's credentials
+// and, as a last resort, OpenCode's legacy auth.json. A source may return a
+// ranked list so a revoked token can fall through to the next candidate.
+type AuthResult = Auth | Auth[] | undefined;
+export type AuthSource = () => AuthResult | Promise<AuthResult>;
 
 function readOpenCodeAuth(): Auth | undefined {
   for (const p of AUTH_PATHS) {
@@ -144,17 +147,39 @@ function isLive(a: Auth, now = Date.now()): boolean {
   return !a.expires || a.expires - AUTH_SKEW_MS >= now;
 }
 
-// First live token in priority order; if none is live, the one expiring last
-// (so the expiry pre-flight still reports it).
+// Candidates ranked for use: live tokens in priority order, then dead ones by
+// latest expiry (so the expiry pre-flight still reports the best of them).
+// Duplicate tokens are dropped.
+export function rankAuth(...candidates: (Auth | undefined)[]): Auth[] {
+  const seen = new Set<string>();
+  const all = candidates.filter((a): a is Auth => {
+    if (!a || seen.has(a.token)) return false;
+    seen.add(a.token);
+    return true;
+  });
+  const live = all.filter((a) => isLive(a));
+  const dead = all
+    .filter((a) => !isLive(a))
+    .sort((x, y) => (y.expires ?? 0) - (x.expires ?? 0));
+  return [...live, ...dead];
+}
+
+// First live token in priority order; if none is live, the one expiring last.
 export function pickAuth(...candidates: (Auth | undefined)[]): Auth | undefined {
-  const all = candidates.filter((a): a is Auth => !!a);
-  const live = all.find((a) => isLive(a));
-  if (live) return live;
-  return all.sort((x, y) => (y.expires ?? 0) - (x.expires ?? 0))[0];
+  return rankAuth(...candidates)[0];
+}
+
+// Claude Code's credentials come first: opencode-claude-auth keeps them
+// refreshed (it writes rotated tokens back to ~/.claude/.credentials.json) but
+// no longer updates OpenCode's legacy auth.json, whose `anthropic` entry can
+// therefore hold a revoked token with a future `expires` indefinitely.
+// auth.json stays as a last resort for older setups.
+export function readAuthCandidates(): Auth[] {
+  return rankAuth(readClaudeCodeAuth(), readOpenCodeAuth());
 }
 
 export function readAuth(): Auth | undefined {
-  return pickAuth(readOpenCodeAuth(), readClaudeCodeAuth());
+  return readAuthCandidates()[0];
 }
 
 // --- Debug log --------------------------------------------------------------
@@ -440,7 +465,7 @@ let unreadableStreak = 0;
 
 // Returns the freshest data for rendering, fetching only when needed and only
 // from one instance at a time.
-export async function getUsage(authSource: AuthSource = readAuth): Promise<Result> {
+export async function getUsage(authSource: AuthSource = readAuthCandidates): Promise<Result> {
   const now = Date.now();
   const read = readCache();
 
@@ -474,19 +499,21 @@ export async function getUsage(authSource: AuthSource = readAuth): Promise<Resul
   // than useless: it cannot succeed, and it spends one of the very few
   // requests the endpoint allows. That is exactly how an overnight token
   // lapse escalated into an hour-long 429 lockout.
-  let auth: Auth | undefined;
+  let candidates: Auth[] = [];
   try {
-    auth = await authSource();
+    const r = await authSource();
+    candidates = (Array.isArray(r) ? r : [r]).filter((a): a is Auth => !!a);
   } catch (e: any) {
     log(`auth source failed: ${e?.message ?? e}`);
   }
+  const auth: Auth | undefined = candidates[0];
   if (!auth) {
     writeCache({ ...cache, error: "no-token", errorKind: "terminal", cooldownUntil: now + AUTH_RECHECK_MS });
     return { rows: cache.rows ?? [], error: "no-token", errorKind: "terminal", fetchedAt: cache.fetchedAt, stale: true };
   }
   if (auth.expires && auth.expires - AUTH_SKEW_MS < now) {
-    // No network call. Re-check soon: OpenCode rewrites auth.json as soon as
-    // it makes any inference call, and we pick that up on the next tick.
+    // No network call. Re-check soon: the credential is refreshed as soon as
+    // OpenCode makes any Claude call, and we pick that up on the next tick.
     writeCache({ ...cache, error: "auth expired", errorKind: "terminal", cooldownUntil: now + AUTH_RECHECK_MS });
     log(`token expired locally - skipping fetch, recheck in ${AUTH_RECHECK_MS / 1000}s`);
     return { rows: cache.rows ?? [], error: "auth expired", errorKind: "terminal", fetchedAt: cache.fetchedAt, stale: true };
@@ -500,7 +527,18 @@ export async function getUsage(authSource: AuthSource = readAuth): Promise<Resul
   // 4. We hold the lock. Fetch.
   const started = Date.now();
   try {
-    const rows = await fetchUsageRaw(auth);
+    let rows: Row[];
+    try {
+      rows = await fetchUsageRaw(auth);
+    } catch (e: any) {
+      // A 401/403 can mean a revoked token that still carries a future
+      // `expires` (e.g. a stale auth.json). Try the next live candidate once
+      // before reporting a terminal "auth expired".
+      const next = candidates.slice(1).find((a) => isLive(a));
+      if (!(e instanceof UsageError && e.kind === "terminal") || !next) throw e;
+      log("auth rejected - retrying once with next live credential");
+      rows = await fetchUsageRaw(next);
+    }
     const fetchedAt = Date.now();
     const ms = fetchedAt - started;
 
@@ -629,5 +667,7 @@ export const __internals = {
   AUTH_SKEW_MS,
   MAX_UNREADABLE_STREAK,
   readAuth,
+  readAuthCandidates,
+  rankAuth,
   fmtAge,
 };

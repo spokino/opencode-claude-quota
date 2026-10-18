@@ -1,6 +1,6 @@
 {
   "name": "opencode-claude-quota",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Show your real Claude subscription usage (5-hour session + weekly limits) in the OpenCode v2 TUI sidebar",
   "keywords": [
     "opencode",

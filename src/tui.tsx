@@ -84,7 +84,7 @@ const setup = (api: any) => {
 
   function prettyErr(m: string): string {
     if (m === "no-token") return "no Anthropic login in OpenCode";
-    if (m === "auth expired") return "token expired - use OpenCode or run claude to refresh";
+    if (m === "auth expired") return "token expired - send a Claude prompt to refresh";
     return m || "fetch failed";
   }
 
